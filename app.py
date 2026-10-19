@@ -11,10 +11,12 @@ import requests
 import scipy.sparse as sp
 import tldextract
 
-app = FastAPI(title="Anti-Phishing ML Service")
+app = FastAPI(title="ML Anti-Phishing Guard")
 
-# Загружаем сохраненный бандл
-bundle = joblib.load("models/phishing_pipeline.joblib")
+# Загрузка сохраненного бандла модели
+MODEL_PATH = "models/phishing_pipeline.joblib"
+bundle = joblib.load(MODEL_PATH)
+
 model = bundle["model"]
 tfidf = bundle["tfidf"]
 rank_dict = bundle["rank_dict"]
@@ -22,8 +24,17 @@ feature_cols = bundle["feature_cols"]
 THRESHOLD = bundle["threshold"]
 
 
-def analyze_url_and_html(url: str):
-  # 1. Попытка легкого сбора HTML (с таймаутом 1.5 сек)
+def normalize_url(raw_url: str) -> str:
+  """Приводит пользовательский ввод к стандартному формату URL."""
+  url = raw_url.strip()
+  # Если пользователь не ввел протокол, по умолчанию добавляем https://
+  if not re.match(r"^https?://", url, re.IGNORECASE):
+    url = "https://" + url
+  return url
+
+
+def extract_features_from_url_and_page(url: str):
+  # 1. Сбор признаков со страницы (HTML) с коротким таймаутом
   html_feats = {
       "html_length": 0,
       "iframe_count": 0,
@@ -38,10 +49,15 @@ def analyze_url_and_html(url: str):
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            " (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
     }
-    resp = requests.get(url, headers=headers, timeout=1.5)
-    content = resp.text.lower()
+    # Таймаут 1.5 секунды, чтобы микросервис не вис на мертвых сайтах
+    response = requests.get(
+        url, headers=headers, timeout=1.5, allow_redirects=True
+    )
+    content = response.text.lower()
+
     html_feats["html_length"] = len(content)
     html_feats["iframe_count"] = content.count("<iframe")
     html_feats["password_input"] = content.count('type="password"')
@@ -50,16 +66,16 @@ def analyze_url_and_html(url: str):
     html_feats["script_count"] = content.count("<script")
     html_feats["eval_count"] = len(re.findall(r"eval\(", content))
   except Exception:
-    # Если сайт мертв/недоступен — оставляем нули, сработают эвристики URL
+    # Если ресурс недоступен или заблокирован — эвристика опирается на URL и репутацию
     pass
 
-  # 2. Признаки самого URL
+  # 2. Извлечение признаков структуры URL и OSINT (Majestic Million)
   ext = tldextract.extract(url)
   root_domain = f"{ext.domain}.{ext.suffix}".lower()
   global_rank = rank_dict.get(root_domain, 2000000)
 
   has_punycode = 1 if "xn--" in url.lower() else 0
-  is_https = 1 if url.startswith("https") else 0
+  is_https = 1 if url.lower().startswith("https://") else 0
   has_ip = 1 if re.search(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}", url) else 0
 
   free_hosts = [
@@ -82,36 +98,44 @@ def analyze_url_and_html(url: str):
       "brand_squatting": brand_squatting,
   }
 
-  # Собираем числовой вектор в том же порядке, что и при обучении
-  all_feats = {**html_feats, **url_feats}
-  num_vector = np.array([[all_feats[col] for col in feature_cols]])
+  # Формирование числового вектора в строгом соответствии с порядком при обучении
+  combined_dict = {**html_feats, **url_feats}
+  numeric_vector = np.array([[combined_dict[col] for col in feature_cols]])
 
-  # TF-IDF по URL
-  tfidf_vec = tfidf.transform([url])
+  # Char TF-IDF векторизация URL
+  tfidf_vector = tfidf.transform([url])
 
-  # Объединяем разреженную матрицу
-  X_input = sp.hstack([tfidf_vec, num_vector]).tocsr()
-  return X_input, all_feats
+  # Объединение в разреженную матрицу для подачи в модель
+  X_final = sp.hstack([tfidf_vector, numeric_vector]).tocsr()
+  return X_final, combined_dict
 
 
-class CheckRequest(BaseModel):
+class URLCheckRequest(BaseModel):
   url: str
 
 
 @app.post("/predict")
-def predict(req: CheckRequest):
-  X_input, feats = analyze_url_and_html(req.url)
-  prob = float(model.predict_proba(X_input)[:, 1][0])
-  is_phish = prob >= THRESHOLD
+def predict_endpoint(req: URLCheckRequest):
+  clean_url = normalize_url(req.url)
+  X_matrix, feats = extract_features_from_url_and_page(clean_url)
+
+  prob = float(model.predict_proba(X_matrix)[:, 1][0])
+  is_phishing = prob >= THRESHOLD
 
   return {
-      "url": req.url,
-      "is_phishing": is_phish,
-      "verdict": "🚨 ФИШИНГ" if is_phish else "✅ БЕЗОПАСНЫЙ РЕСУРС",
+      "input_url": req.url,
+      "normalized_url": clean_url,
+      "is_phishing": is_phishing,
+      "verdict": "🚨 ФИШИНГ" if is_phishing else "✅ БЕЗОПАСНЫЙ РЕСУРС",
       "phishing_probability": round(prob, 4),
       "threshold": round(THRESHOLD, 4),
       "details": {
-          "domain_rank": feats["global_rank"],
+          "domain_rank": (
+              feats["global_rank"]
+              if feats["global_rank"] < 2000000
+              else "Не входит в Топ-1М"
+          ),
+          "is_https": bool(feats["is_https"]),
           "password_fields": feats["password_input"],
           "punycode_detected": bool(feats["has_punycode"]),
           "brand_squatting": bool(feats["brand_squatting"]),
@@ -120,66 +144,149 @@ def predict(req: CheckRequest):
 
 
 @app.get("/", response_class=HTMLResponse)
-def home():
+def index_page():
   return """
     <!DOCTYPE html>
     <html lang="ru">
     <head>
         <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>ML Anti-Phishing Guard</title>
         <style>
-            body { font-family: system-ui, sans-serif; background: #0b0f19; color: #f1f5f9; display: flex; justify-content: center; padding-top: 50px; }
-            .box { background: #1e293b; border: 1px solid #334155; border-radius: 12px; width: 620px; padding: 30px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
-            h2 { margin-top: 0; color: #38bdf8; }
-            .badge { background: #0369a1; color: #e0f2fe; padding: 4px 10px; border-radius: 6px; font-size: 12px; font-weight: bold; }
-            input { width: 100%; box-sizing: border-box; padding: 12px; margin: 18px 0 10px 0; background: #0f172a; border: 1px solid #475569; border-radius: 6px; color: #fff; font-size: 15px; }
-            button { width: 100%; padding: 12px; background: #0284c7; border: none; border-radius: 6px; color: white; font-weight: bold; font-size: 16px; cursor: pointer; transition: 0.2s; }
-            button:hover { background: #0369a1; }
-            #res { margin-top: 20px; padding: 16px; border-radius: 8px; display: none; line-height: 1.6; }
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                background-color: #0b0f19;
+                color: #f1f5f9;
+                display: flex;
+                justify-content: center;
+                padding-top: 50px;
+                margin: 0;
+            }
+            .container {
+                background: #1e293b;
+                border: 1px solid #334155;
+                border-radius: 12px;
+                width: 90%;
+                max-width: 620px;
+                padding: 30px;
+                box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+            }
+            .badge {
+                background: #0284c7;
+                color: #e0f2fe;
+                padding: 4px 10px;
+                border-radius: 6px;
+                font-size: 12px;
+                font-weight: 700;
+                letter-spacing: 0.5px;
+            }
+            h2 {
+                margin: 15px 0 8px 0;
+                color: #38bdf8;
+            }
+            p.sub {
+                color: #94a3b8;
+                font-size: 14px;
+                margin-top: 0;
+                margin-bottom: 20px;
+                line-height: 1.4;
+            }
+            input {
+                width: 100%;
+                box-sizing: border-box;
+                padding: 13px 15px;
+                background: #0f172a;
+                border: 1px solid #475569;
+                border-radius: 8px;
+                color: #fff;
+                font-size: 15px;
+                outline: none;
+                transition: 0.2s;
+            }
+            input:focus {
+                border-color: #38bdf8;
+                box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.2);
+            }
+            button {
+                width: 100%;
+                margin-top: 12px;
+                padding: 13px;
+                background: #0284c7;
+                border: none;
+                border-radius: 8px;
+                color: #ffffff;
+                font-weight: 700;
+                font-size: 16px;
+                cursor: pointer;
+                transition: 0.2s;
+            }
+            button:hover {
+                background: #0369a1;
+            }
+            #resultBox {
+                margin-top: 22px;
+                padding: 18px;
+                border-radius: 8px;
+                display: none;
+                line-height: 1.6;
+            }
         </style>
     </head>
     <body>
-        <div class="box">
+        <div class="container">
             <span class="badge">TOP-10 ХАКАТОН • КИБЕРБЕЗОПАСНОСТЬ</span>
             <h2>🛡️ ML Детектор Фишинга (LightGBM)</h2>
-            <p style="color: #94a3b8; font-size: 14px;">Комплексный анализ URL: n-граммы, лексические маркеры, Majestic Million и HTML-инспекция.</p>
-            <input type="text" id="url" placeholder="Вставьте ссылку, например: https://sber-verify.online/login" />
-            <button onclick="check()">Проверить URL</button>
-            <div id="res"></div>
+            <p class="sub">Комплексный анализ URL: n-граммы, лексические маркеры, Majestic Million и HTML-инспекция.</p>
+            
+            <input type="text" id="targetUrl" placeholder="Введите адрес (например: ya.ru или https://sber-verify.online)" onkeydown="if(event.key==='Enter') checkUrl()" />
+            <button onclick="checkUrl()">Проверить URL</button>
+
+            <div id="resultBox"></div>
         </div>
+
         <script>
-            async function check() {
-                const u = document.getElementById('url').value.trim();
-                if(!u) return;
-                const r = document.getElementById('res');
-                r.style.display = 'block';
-                r.style.background = '#1e293b';
-                r.style.border = '1px solid #475569';
-                r.innerHTML = '⏳ Выполняется анализ параметров URL и контента...';
+            async function checkUrl() {
+                const inputField = document.getElementById('targetUrl');
+                const rawUrl = inputField.value.trim();
+                if (!rawUrl) return;
+
+                const box = document.getElementById('resultBox');
+                box.style.display = 'block';
+                box.style.background = '#1e293b';
+                box.style.border = '1px solid #475569';
+                box.innerHTML = '⏳ Выполняется инспекция структуры URL и контента...';
+
                 try {
-                    const resp = await fetch('/predict', {
+                    const response = await fetch('/predict', {
                         method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({url: u})
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ url: rawUrl })
                     });
-                    const d = await resp.json();
-                    const color = d.is_phishing ? '#ef4444' : '#22c55e';
-                    r.style.border = `1px solid ${color}`;
-                    r.style.background = d.is_phishing ? 'rgba(239, 68, 68, 0.1)' : 'rgba(34, 197, 94, 0.1)';
-                    r.innerHTML = `
-                        <div style="font-size: 18px; font-weight: bold; color: ${color}; margin-bottom: 8px;">${d.verdict}</div>
-                        <div><b>Вероятность фишинга:</b> ${(d.phishing_probability * 100).toFixed(1)}%</div>
-                        <div><b>Рабочий порог:</b> ${d.threshold}</div>
-                        <hr style="border: 0; border-top: 1px solid #334155; margin: 10px 0;">
+                    const data = await response.json();
+
+                    const isPhish = data.is_phishing;
+                    const color = isPhish ? '#ef4444' : '#22c55e';
+                    box.style.border = `1px solid ${color}`;
+                    box.style.background = isPhish ? 'rgba(239, 68, 68, 0.12)' : 'rgba(34, 197, 94, 0.12)';
+
+                    box.innerHTML = `
+                        <div style="font-size: 19px; font-weight: bold; color: ${color}; margin-bottom: 6px;">${data.verdict}</div>
+                        <div><b>Проверенный URL:</b> <code>${data.normalized_url}</code></div>
+                        <div><b>Вероятность фишинга:</b> ${(data.phishing_probability * 100).toFixed(1)}%</div>
+                        <div><b>Рабочий порог:</b> ${data.threshold}</div>
+                        <hr style="border: 0; border-top: 1px solid #334155; margin: 12px 0;">
                         <div style="font-size: 13px; color: #cbd5e1;">
-                            • Ранг домена в Majestic: <b>${d.details.domain_rank > 1000000 ? 'Не входит в топ (Подозрительно)' : d.details.domain_rank}</b><br>
-                            • Полей пароля на странице: <b>${d.details.password_fields}</b><br>
-                            • Punycode (IDN spoofing): <b>${d.details.punycode_detected ? 'Да (Опасно)' : 'Нет'}</b><br>
-                            • Мимикрия под бренд: <b>${d.details.brand_squatting ? 'Обнаружена' : 'Нет'}</b>
+                            • Ранг Majestic Million: <b>${data.details.domain_rank}</b><br>
+                            • Наличие HTTPS: <b>${data.details.is_https ? 'Да' : 'Нет'}</b><br>
+                            • Полей пароля в форме: <b>${data.details.password_fields}</b><br>
+                            • Punycode (IDN spoofing): <b>${data.details.punycode_detected ? 'Обнаружен (Опасно)' : 'Нет'}</b><br>
+                            • Мимикрия под бренд: <b>${data.details.brand_squatting ? 'Обнаружена' : 'Нет'}</b>
                         </div>
                     `;
-                } catch(e) {
-                    r.innerHTML = '❌ Ошибка при обращении к микросервису.';
+                } catch (err) {
+                    box.style.border = '1px solid #ef4444';
+                    box.style.background = 'rgba(239, 68, 68, 0.1)';
+                    box.innerHTML = '❌ Ошибка связи с микросервисом. Попробуйте еще раз.';
                 }
             }
         </script>
