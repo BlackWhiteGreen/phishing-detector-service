@@ -2,7 +2,7 @@ import ipaddress
 import os
 import re
 import socket
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from bs4 import BeautifulSoup
 from fastapi import FastAPI
@@ -18,7 +18,7 @@ import urllib3
 # Отключаем предупреждения об отсутствии SSL-верификации при проверке подозрительных узлов
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-app = FastAPI(title="ML Anti-Phishing Guard", version="2.0.0")
+app = FastAPI(title="ML Anti-Phishing Guard", version="2.1.0")
 
 # Инициализируем tldextract без внешних сетевых запросов при холодном старте
 tld_extractor = tldextract.TLDExtract(suffix_list_urls=())
@@ -33,20 +33,28 @@ rank_dict = bundle["rank_dict"]
 feature_cols = bundle["feature_cols"]
 THRESHOLD = float(bundle["threshold"])
 
-# Официальные домены брендов для точного отделения легитимного ресурса от фишинга
+# Официальные домены брендов (включая кириллические синонимы для защиты зоны .рф)
 OFFICIAL_BRAND_DOMAINS = {
     "apple": {"apple.com", "icloud.com"},
+    "icloud": {"icloud.com", "apple.com"},
     "sberbank": {"sberbank.ru", "sberbank.com", "sber.ru"},
     "sber": {"sberbank.ru", "sber.ru", "sbermegamarket.ru", "sbermarket.ru"},
+    "сбер": {"sberbank.ru", "sber.ru", "сбербанк.рф", "сбер.рф"},
     "paypal": {"paypal.com", "paypal.me"},
     "microsoft": {"microsoft.com", "live.com", "office.com", "azure.com"},
     "google": {"google.com", "google.ru", "youtube.com", "gmail.com", "googleapis.com"},
     "yandex": {"yandex.ru", "ya.ru", "yandex.com", "yandex.net", "clck.ru"},
+    "яндекс": {"yandex.ru", "ya.ru", "яндекс.рф"},
     "gosuslugi": {"gosuslugi.ru"},
+    "госуслуг": {"gosuslugi.ru", "госуслуги.рф"},
     "tbank": {"tbank.ru", "tinkoff.ru"},
     "tinkoff": {"tbank.ru", "tinkoff.ru"},
+    "тинькофф": {"tbank.ru", "tinkoff.ru"},
+    "тбанк": {"tbank.ru", "tinkoff.ru"},
     "vtb": {"vtb.ru"},
+    "втб": {"vtb.ru"},
     "alfabank": {"alfabank.ru"},
+    "альфабанк": {"alfabank.ru"},
     "vk": {"vk.com", "vk.ru", "vkvideo.ru"},
     "telegram": {"telegram.org", "t.me"},
     "ozon": {"ozon.ru"},
@@ -54,10 +62,20 @@ OFFICIAL_BRAND_DOMAINS = {
     "steam": {"steampowered.com", "steamcommunity.com"},
 }
 
-# Доверенные домены (защита от False Positive при блокировке зарубежных IP хостинга Render)
+# Доверенные домены (защита от False Positive при гео-блокировке зарубежных IP хостинга Render)
 TRUSTED_ROOT_DOMAINS = (
     set().union(*OFFICIAL_BRAND_DOMAINS.values())
     | {
+        "президент.рф",
+        "xn--d1abbgf6aiiy.xn--p1ai",
+        "правительство.рф",
+        "xn--80aealotwbjpid2k.xn--p1ai",
+        "мгу.рф",
+        "москва.рф",
+        "национальныепроекты.рф",
+        "объясняем.рф",
+        "kremlin.ru",
+        "government.ru",
         "github.com",
         "gitlab.com",
         "habr.com",
@@ -106,9 +124,10 @@ FREE_HOSTS = (
     "blogspot.com",
 )
 
-# Маркеры социальной инженерии в URL
+# Маркеры социальной инженерии в URL (латиница + кириллица)
 PHISHING_KEYWORDS = re.compile(
-    r"(verify|secure|login|signin|auth|account|update|confirm|kabinet|support|wallet|bonus|claim|recover|unlock|password|pay|bank)",
+    r"(verify|secure|login|signin|auth|account|update|confirm|kabinet|support|wallet|bonus|claim|recover|unlock|password|pay|bank|"
+    r"вход|кабинет|проверк|выплат|парол|подтверд|безопасн|аккаунт|бонус)",
     re.IGNORECASE,
 )
 
@@ -127,12 +146,33 @@ def normalize_url(raw_url: str) -> str:
     return url
 
 
+def to_unicode_hostname(hostname: str) -> str:
+    """Декодирует Punycode-домен в читаемый Unicode (например, xn--d1abbgf6aiiy.xn--p1ai -> президент.рф)."""
+    if not hostname:
+        return ""
+    try:
+        return hostname.encode("ascii").decode("idna").lower()
+    except Exception:
+        return hostname.lower()
+
+
+def to_idna_hostname(hostname: str) -> str:
+    """Кодирует Unicode-домен в стандарт IDNA ASCII (Punycode)."""
+    if not hostname:
+        return ""
+    try:
+        return hostname.encode("idna").decode("ascii").lower()
+    except Exception:
+        return hostname.lower()
+
+
 def is_safe_public_host(hostname: str) -> bool:
     """Защита от SSRF: проверяет, что хост не указывает на локальную/внутреннюю сеть."""
     if not hostname:
         return False
+    idna_host = to_idna_hostname(hostname)
     try:
-        ip_str = socket.gethostbyname(hostname)
+        ip_str = socket.gethostbyname(idna_host)
         ip_obj = ipaddress.ip_address(ip_str)
         return not (
             ip_obj.is_private
@@ -146,47 +186,58 @@ def is_safe_public_host(hostname: str) -> bool:
 
 def detect_idn_and_homograph(hostname: str, suffix: str) -> tuple[int, bool]:
     """
-    Определяет наличие Punycode и идеографических атак (смешение кириллицы и латиницы).
-    Возвращает (has_punycode_flag, is_homograph_attack).
+    Определяет наличие Punycode-спуфинга и идеографических атак (смешение кириллицы и латиницы).
+    Чистые кириллические домены в национальных зонах (.рф, .рус) не штрафуются.
     """
     if not hostname:
         return 0, False
 
-    try:
-        idna_host = hostname.encode("idna").decode("ascii").lower()
-    except Exception:
-        idna_host = hostname.lower()
+    idna_host = to_idna_hostname(hostname)
+    unicode_host = to_unicode_hostname(hostname)
+    unicode_suffix = to_unicode_hostname(suffix)
 
     has_xn = "xn--" in idna_host
 
     # Проверяем смешение латиницы и кириллицы внутри одной метки домена (например, sberbаnk.ru)
-    labels = hostname.lower().split(".")
+    labels = unicode_host.split(".")
     mixed_script = False
-    for label in labels:
+    has_any_latin_in_domain = False
+    for label in labels[:-1] if len(labels) > 1 else labels:
         has_latin = bool(re.search(r"[a-z]", label))
         has_cyrillic = bool(re.search(r"[а-яё]", label))
+        if has_latin:
+            has_any_latin_in_domain = True
         if has_latin and has_cyrillic:
             mixed_script = True
             break
 
-    # Чисто кириллические домены в зонах .рф / .рус / .su без смешения алфавитов легитимны
-    is_pure_cyrillic_zone = suffix.lower() in {"рф", "xn--p1ai", "рус", "xn--p1acf"}
     if mixed_script:
         return 1, True
-    if has_xn and not is_pure_cyrillic_zone:
+
+    # Если домен в национальной кириллической зоне (.рф / .рус) и написан целиком на кириллице — это норма, а не спуфинг
+    is_cyrillic_tld = unicode_suffix in {"рф", "рус", "бел", "укр", "срб", "бг"} or suffix.lower() in {
+        "xn--p1ai",
+        "xn--p1acf",
+    }
+    if is_cyrillic_tld and not has_any_latin_in_domain:
+        return 0, False
+
+    # Если Punycode используется в традиционной латинской зоне (.ru, .com, .org и т.д.) — это риск IDN-спуфинга
+    if has_xn:
         return 1, True
 
-    return (1 if has_xn else 0), False
+    return 0, False
 
 
-def detect_brand_squatting(url_lower: str, root_domain: str) -> int:
+def detect_brand_squatting(url_lower: str, unicode_root: str, idna_root: str) -> int:
     """
     Возвращает 1 только если имя бренда упоминается в URL,
     но сам корневой домен НЕ принадлежит этому бренду.
     """
+    decoded_url = unquote(url_lower)
     for brand, official_domains in OFFICIAL_BRAND_DOMAINS.items():
-        if brand in url_lower:
-            if root_domain not in official_domains:
+        if brand in decoded_url or brand in unicode_root:
+            if unicode_root not in official_domains and idna_root not in official_domains:
                 return 1
     return 0
 
@@ -224,7 +275,6 @@ def fetch_html_features(url: str, hostname: str) -> tuple[dict, bool]:
             verify=False,
         ) as response:
             page_reachable = response.status_code < 500
-            # Ограничиваем чтение первыми 256 КБ для защиты от переполнения памяти (OOM)
             chunks = []
             bytes_read = 0
             for chunk in response.iter_content(chunk_size=16384):
@@ -274,20 +324,19 @@ def extract_features_from_url_and_page(url: str):
 
     # 2. Извлечение признаков структуры URL и OSINT (Majestic Million)
     ext = tld_extractor(hostname)
-    root_domain = f"{ext.domain}.{ext.suffix}".lower() if ext.suffix else hostname
-
-    # Проверяем также ASCII/IDNA представление для корректного поиска в словаре рангов
-    try:
-        idna_root = root_domain.encode("idna").decode("ascii").lower()
-    except Exception:
-        idna_root = root_domain
+    raw_root = f"{ext.domain}.{ext.suffix}".lower() if ext.suffix else hostname
+    unicode_root = to_unicode_hostname(raw_root)
+    idna_root = to_idna_hostname(raw_root)
 
     global_rank = min(
-        rank_dict.get(root_domain, 2000000),
+        rank_dict.get(raw_root, 2000000),
+        rank_dict.get(unicode_root, 2000000),
         rank_dict.get(idna_root, 2000000),
     )
-    if root_domain in TRUSTED_ROOT_DOMAINS and global_rank == 2000000:
-        global_rank = 1500  # Гарантируем высокий ранг для проверенных доменов
+    if (
+        unicode_root in TRUSTED_ROOT_DOMAINS or idna_root in TRUSTED_ROOT_DOMAINS
+    ) and global_rank == 2000000:
+        global_rank = 1500
 
     has_punycode, is_homograph = detect_idn_and_homograph(hostname, ext.suffix)
     is_https = 1 if url_lower.startswith("https://") else 0
@@ -301,7 +350,7 @@ def extract_features_from_url_and_page(url: str):
     )
 
     is_free_hosting = 1 if any(h in url_lower for h in FREE_HOSTS) else 0
-    brand_squatting = detect_brand_squatting(url_lower, root_domain)
+    brand_squatting = detect_brand_squatting(url_lower, unicode_root, idna_root)
 
     url_feats = {
         "global_rank": global_rank,
@@ -322,13 +371,18 @@ def extract_features_from_url_and_page(url: str):
     # Объединение в разреженную матрицу для подачи в модель
     X_final = sp.hstack([tfidf_vector, numeric_vector]).tocsr()
 
+    decoded_full_url = unquote(url_lower)
     meta = {
-        "root_domain": root_domain,
+        "root_domain": unicode_root,
+        "idna_root": idna_root,
         "subdomain": ext.subdomain.lower(),
-        "suffix": ext.suffix.lower(),
+        "suffix": to_unicode_hostname(ext.suffix),
         "is_homograph": is_homograph,
         "page_reachable": page_reachable,
-        "has_phishing_keywords": bool(PHISHING_KEYWORDS.search(url_lower)),
+        "has_phishing_keywords": bool(
+            PHISHING_KEYWORDS.search(decoded_full_url)
+            or PHISHING_KEYWORDS.search(unicode_root)
+        ),
     }
     return X_final, combined_dict, meta
 
@@ -342,15 +396,21 @@ def calibrate_phishing_probability(
     """
     prob = raw_prob
     root_domain = meta["root_domain"]
+    idna_root = meta["idna_root"]
     suffix = meta["suffix"]
 
     is_gov_or_edu = suffix in {"gov.ru", "edu.ru", "mil.ru", "gov", "edu"} or root_domain.endswith(
         (".gov.ru", ".edu.ru")
     )
+    in_whitelist = root_domain in TRUSTED_ROOT_DOMAINS or idna_root in TRUSTED_ROOT_DOMAINS
+
+    # Домен считается доверенным, если он в белом списке, в топ-100К глобального рейтинга,
+    # либо входит в топ-500К Majestic Million без подозрительных фишинговых слов в адресе
     is_trusted_domain = (
-        root_domain in TRUSTED_ROOT_DOMAINS
+        in_whitelist
         or is_gov_or_edu
         or feats["global_rank"] <= 100000
+        or (feats["global_rank"] <= 500000 and not meta["has_phishing_keywords"])
     )
 
     # 1. Контур защиты от False Negative (явные индикаторы компрометации)
@@ -366,7 +426,6 @@ def calibrate_phishing_probability(
         return max(prob, max(THRESHOLD + 0.25, 0.88)), "Авторизация по прямому IP-адресу"
 
     if not is_trusted_domain and feats["global_rank"] == 2000000:
-        # Если домен неизвестен и использует фишинговые лексемы или подозрительную TLD-зону
         if meta["has_phishing_keywords"] and (
             suffix in SUSPICIOUS_TLDS or "-" in root_domain or feats["password_input"] > 0
         ):
@@ -376,16 +435,19 @@ def calibrate_phishing_probability(
         ):
             return max(prob, max(THRESHOLD + 0.20, 0.84)), "Подозрительная форма на бесплатном хостинге"
 
-    # 2. Контур защиты бизнеса от False Positive (подтвержденная репутация домена)
+    # 2. Контур защиты бизнеса от False Positive (с плавным демпфированием без константы 15.0%)
     if (
         is_trusted_domain
         and feats["is_free_hosting"] == 0
         and feats["brand_squatting"] == 0
         and not meta["is_homograph"]
     ):
-        # Демпфируем шум символьного TF-IDF на легитимных сайтах из Топ-100К и белого списка
-        safe_cap = min(THRESHOLD * 0.45, 0.15)
-        prob = min(prob, safe_cap)
+        # Плавное масштабирование на основе ранга домена и сырого скора модели,
+        # чтобы каждый легитимный сайт имел уникальную низкую вероятность (0.3% - 7.5%)
+        rank_norm = min(feats["global_rank"] / 500000.0, 1.0)
+        damping_factor = 0.032 + 0.045 * rank_norm
+        attenuated_prob = raw_prob * damping_factor
+        prob = min(raw_prob, attenuated_prob) if raw_prob > 0.06 else raw_prob
         return prob, "Подтвержденная доменная репутация"
 
     return prob, "Оценка ансамбля LightGBM + TF-IDF"
@@ -558,6 +620,7 @@ async def index_page():
             <div class="presets">
                 <button class="preset-btn" onclick="fillAndCheck('https://ya.ru')">✅ ya.ru</button>
                 <button class="preset-btn" onclick="fillAndCheck('https://sberbank.ru')">✅ sberbank.ru</button>
+                <button class="preset-btn" onclick="fillAndCheck('https://президент.рф')">✅ президент.рф</button>
                 <button class="preset-btn" onclick="fillAndCheck('https://sber-verify.online/login')">🚨 sber-verify.online</button>
                 <button class="preset-btn" onclick="fillAndCheck('https://sberbаnk.ru')">🚨 IDN Homograph</button>
             </div>
