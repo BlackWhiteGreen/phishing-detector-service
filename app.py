@@ -18,7 +18,7 @@ import urllib3
 # Отключаем предупреждения об отсутствии SSL-верификации при проверке подозрительных узлов
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-app = FastAPI(title="ML Anti-Phishing Guard", version="2.1.0")
+app = FastAPI(title="ML Anti-Phishing Guard", version="2.2.0")
 
 # Инициализируем tldextract без внешних сетевых запросов при холодном старте
 tld_extractor = tldextract.TLDExtract(suffix_list_urls=())
@@ -55,12 +55,21 @@ OFFICIAL_BRAND_DOMAINS = {
     "втб": {"vtb.ru"},
     "alfabank": {"alfabank.ru"},
     "альфабанк": {"alfabank.ru"},
+    "vkontakte": {"vk.com", "vk.ru", "vkvideo.ru"},
     "vk": {"vk.com", "vk.ru", "vkvideo.ru"},
     "telegram": {"telegram.org", "t.me"},
     "ozon": {"ozon.ru"},
     "wildberries": {"wildberries.ru", "wb.ru"},
+    "avito": {"avito.ru"},
+    "авито": {"avito.ru"},
+    "cdek": {"cdek.ru"},
+    "сдэк": {"cdek.ru"},
     "steam": {"steampowered.com", "steamcommunity.com"},
 }
+
+# Короткие бренды (<= 3 символов), которые нужно искать только как отдельные токены,
+# чтобы не срабатывать на слова вроде "slivki.ru" (внутри есть "vk")
+SHORT_BRAND_TOKENS = {"vk", "vtb", "втб"}
 
 # Доверенные домены (защита от False Positive при гео-блокировке зарубежных IP хостинга Render)
 TRUSTED_ROOT_DOMAINS = (
@@ -82,7 +91,6 @@ TRUSTED_ROOT_DOMAINS = (
         "rbc.ru",
         "mail.ru",
         "dzen.ru",
-        "avito.ru",
         "hh.ru",
         "rutube.ru",
         "kinopoisk.ru",
@@ -122,19 +130,29 @@ FREE_HOSTS = (
     "000webhostapp.com",
     "weebly.com",
     "blogspot.com",
+    "wixsite.com",
+    "webflow.io",
+    "glitch.me",
+    "surge.sh",
 )
 
 # Маркеры социальной инженерии в URL (латиница + кириллица)
 PHISHING_KEYWORDS = re.compile(
-    r"(verify|secure|login|signin|auth|account|update|confirm|kabinet|support|wallet|bonus|claim|recover|unlock|password|pay|bank|"
-    r"вход|кабинет|проверк|выплат|парол|подтверд|безопасн|аккаунт|бонус)",
+    r"(verify|secure|login|signin|auth|account|update|confirm|kabinet|wallet|bonus|claim|recover|unlock|password|bank|webmail|wp-admin|"
+    r"вход|кабинет|проверк|выплат|парол|подтверд|безопасн|аккаунт|бонус|возврат)",
+    re.IGNORECASE,
+)
+
+# Признаки сбора платежных карт / СМС-кодов в HTML-полях ввода
+SENSITIVE_INPUT_PATTERN = re.compile(
+    r"(cardnumber|cc-number|cvv|cvc|cc-csc|pan|expir|sms[-_]?code|otp|seed|mnemonic|pin[-_]?code)",
     re.IGNORECASE,
 )
 
 # Доменные зоны верхнего уровня с повышенной концентрацией дешевого фишинга
 SUSPICIOUS_TLDS = {
     "xyz", "top", "online", "site", "club", "info", "pw",
-    "icu", "buzz", "cfd", "sbs", "tk", "ml", "ga", "cf", "gq", "shop", "live"
+    "icu", "buzz", "cfd", "sbs", "tk", "ml", "ga", "cf", "gq", "shop", "live", "click", "link", "rest", "fit", "work"
 }
 
 
@@ -167,7 +185,7 @@ def to_idna_hostname(hostname: str) -> str:
 
 
 def is_safe_public_host(hostname: str) -> bool:
-    """Защита от SSRF: проверяет, что хост не указывает на локальную/внутреннюю сеть."""
+    """Защита от SSRF: проверяет, что хост существует в DNS и не указывает на внутреннюю сеть."""
     if not hostname:
         return False
     idna_host = to_idna_hostname(hostname)
@@ -198,7 +216,6 @@ def detect_idn_and_homograph(hostname: str, suffix: str) -> tuple[int, bool]:
 
     has_xn = "xn--" in idna_host
 
-    # Проверяем смешение латиницы и кириллицы внутри одной метки домена (например, sberbаnk.ru)
     labels = unicode_host.split(".")
     mixed_script = False
     has_any_latin_in_domain = False
@@ -214,7 +231,6 @@ def detect_idn_and_homograph(hostname: str, suffix: str) -> tuple[int, bool]:
     if mixed_script:
         return 1, True
 
-    # Если домен в национальной кириллической зоне (.рф / .рус) и написан целиком на кириллице — это норма, а не спуфинг
     is_cyrillic_tld = unicode_suffix in {"рф", "рус", "бел", "укр", "срб", "бг"} or suffix.lower() in {
         "xn--p1ai",
         "xn--p1acf",
@@ -222,7 +238,6 @@ def detect_idn_and_homograph(hostname: str, suffix: str) -> tuple[int, bool]:
     if is_cyrillic_tld and not has_any_latin_in_domain:
         return 0, False
 
-    # Если Punycode используется в традиционной латинской зоне (.ru, .com, .org и т.д.) — это риск IDN-спуфинга
     if has_xn:
         return 1, True
 
@@ -236,14 +251,22 @@ def detect_brand_squatting(url_lower: str, unicode_root: str, idna_root: str) ->
     """
     decoded_url = unquote(url_lower)
     for brand, official_domains in OFFICIAL_BRAND_DOMAINS.items():
-        if brand in decoded_url or brand in unicode_root:
-            if unicode_root not in official_domains and idna_root not in official_domains:
+        if unicode_root in official_domains or idna_root in official_domains:
+            continue
+
+        if brand in SHORT_BRAND_TOKENS:
+            # Короткие бренды ищем только как отдельные слова/токены через разделители
+            pattern = rf"(?:^|[^a-zа-яё0-9]){re.escape(brand)}(?:$|[^a-zа-яё0-9])"
+            if re.search(pattern, decoded_url) or re.search(pattern, unicode_root):
+                return 1
+        else:
+            if brand in decoded_url or brand in unicode_root:
                 return 1
     return 0
 
 
-def fetch_html_features(url: str, hostname: str) -> tuple[dict, bool]:
-    """Безопасно скачивает до 256 КБ HTML и извлекает признаки через BeautifulSoup."""
+def fetch_html_features(url: str, hostname: str) -> tuple[dict, dict]:
+    """Безопасно скачивает до 256 КБ HTML, извлекает признаки для модели и маркеры верификации контента."""
     html_feats = {
         "html_length": 0,
         "iframe_count": 0,
@@ -253,10 +276,15 @@ def fetch_html_features(url: str, hostname: str) -> tuple[dict, bool]:
         "script_count": 0,
         "eval_count": 0,
     }
-    page_reachable = False
+    dom_meta = {
+        "page_reachable": False,
+        "has_sensitive_inputs": False,
+        "anchor_count": 0,
+        "has_title": False,
+    }
 
     if not is_safe_public_host(hostname):
-        return html_feats, False
+        return html_feats, dom_meta
 
     try:
         headers = {
@@ -269,12 +297,12 @@ def fetch_html_features(url: str, hostname: str) -> tuple[dict, bool]:
         with requests.get(
             url,
             headers=headers,
-            timeout=2.0,
+            timeout=2.5,
             allow_redirects=True,
             stream=True,
             verify=False,
         ) as response:
-            page_reachable = response.status_code < 500
+            dom_meta["page_reachable"] = response.status_code < 500
             chunks = []
             bytes_read = 0
             for chunk in response.iter_content(chunk_size=16384):
@@ -295,23 +323,40 @@ def fetch_html_features(url: str, hostname: str) -> tuple[dict, bool]:
             html_feats["iframe_count"] = len(soup.find_all("iframe"))
             html_feats["form_count"] = len(soup.find_all("form"))
             html_feats["script_count"] = len(soup.find_all("script"))
-            html_feats["password_input"] = len(
-                soup.find_all(
-                    "input",
-                    attrs={"type": re.compile(r"^password$", re.IGNORECASE)},
+
+            all_inputs = soup.find_all("input")
+            pwd_count = 0
+            hidden_count = 0
+            sensitive_found = False
+
+            for inp in all_inputs:
+                inp_type = str(inp.get("type", "")).strip().lower()
+                if inp_type == "password":
+                    pwd_count += 1
+                elif inp_type == "hidden":
+                    hidden_count += 1
+
+                # Проверка на поля сбора банковских карт, CVV, OTP и seed-фраз
+                attrs_blob = " ".join(
+                    str(inp.get(attr, ""))
+                    for attr in ("name", "id", "placeholder", "autocomplete")
                 )
-            )
-            html_feats["hidden_input"] = len(
-                soup.find_all(
-                    "input",
-                    attrs={"type": re.compile(r"^hidden$", re.IGNORECASE)},
-                )
-            )
+                if SENSITIVE_INPUT_PATTERN.search(attrs_blob):
+                    sensitive_found = True
+
+            html_feats["password_input"] = pwd_count
+            html_feats["hidden_input"] = hidden_count
             html_feats["eval_count"] = len(re.findall(r"\beval\s*\(", content_lower))
+
+            dom_meta["has_sensitive_inputs"] = sensitive_found
+            dom_meta["anchor_count"] = len(soup.find_all("a"))
+            dom_meta["has_title"] = bool(
+                soup.title and soup.title.string and soup.title.string.strip()
+            )
     except Exception:
         pass
 
-    return html_feats, page_reachable
+    return html_feats, dom_meta
 
 
 def extract_features_from_url_and_page(url: str):
@@ -320,7 +365,7 @@ def extract_features_from_url_and_page(url: str):
     url_lower = url.lower()
 
     # 1. Сбор признаков со страницы (HTML)
-    html_feats, page_reachable = fetch_html_features(url, hostname)
+    html_feats, dom_meta = fetch_html_features(url, hostname)
 
     # 2. Извлечение признаков структуры URL и OSINT (Majestic Million)
     ext = tld_extractor(hostname)
@@ -375,10 +420,14 @@ def extract_features_from_url_and_page(url: str):
     meta = {
         "root_domain": unicode_root,
         "idna_root": idna_root,
+        "domain_name_only": to_unicode_hostname(ext.domain),
         "subdomain": ext.subdomain.lower(),
         "suffix": to_unicode_hostname(ext.suffix),
         "is_homograph": is_homograph,
-        "page_reachable": page_reachable,
+        "page_reachable": dom_meta["page_reachable"],
+        "has_sensitive_inputs": dom_meta["has_sensitive_inputs"],
+        "anchor_count": dom_meta["anchor_count"],
+        "has_title": dom_meta["has_title"],
         "has_phishing_keywords": bool(
             PHISHING_KEYWORDS.search(decoded_full_url)
             or PHISHING_KEYWORDS.search(unicode_root)
@@ -391,8 +440,10 @@ def calibrate_phishing_probability(
     raw_prob: float, feats: dict, meta: dict
 ) -> tuple[float, str]:
     """
-    Двухконтурная калибровка (ML + Threat Intelligence Guardrails).
-    Защищает бизнес-процессы от False Positive и блокирует явный фишинг при недоступном HTML.
+    Трехконтурная калибровка (ML + Threat Intelligence + Контент-инспекция МСБ).
+    1. Блокирует явный фишинг (False Negative Guard).
+    2. Защищает сайты из Топ-500К и белого списка (Domain Reputation Guard).
+    3. Защищает легитимные сайты малого бизнеса вне Топ-1М, если на них нет форм кражи данных (SMB Content Guard).
     """
     prob = raw_prob
     root_domain = meta["root_domain"]
@@ -404,8 +455,6 @@ def calibrate_phishing_probability(
     )
     in_whitelist = root_domain in TRUSTED_ROOT_DOMAINS or idna_root in TRUSTED_ROOT_DOMAINS
 
-    # Домен считается доверенным, если он в белом списке, в топ-100К глобального рейтинга,
-    # либо входит в топ-500К Majestic Million без подозрительных фишинговых слов в адресе
     is_trusted_domain = (
         in_whitelist
         or is_gov_or_edu
@@ -413,7 +462,7 @@ def calibrate_phishing_probability(
         or (feats["global_rank"] <= 500000 and not meta["has_phishing_keywords"])
     )
 
-    # 1. Контур защиты от False Negative (явные индикаторы компрометации)
+    # --- КОНТУР 1: Защита от пропуска атак (Anti-False-Negative) ---
     if meta["is_homograph"]:
         return max(prob, max(THRESHOLD + 0.35, 0.96)), "IDN Homograph (подмена символов)"
 
@@ -431,24 +480,49 @@ def calibrate_phishing_probability(
         ):
             return max(prob, max(THRESHOLD + 0.20, 0.85)), "Фишинговые маркеры на неизвестном домене"
         if feats["is_free_hosting"] == 1 and (
-            feats["password_input"] > 0 or meta["has_phishing_keywords"]
+            feats["password_input"] > 0 or meta["has_phishing_keywords"] or prob >= THRESHOLD
         ):
-            return max(prob, max(THRESHOLD + 0.20, 0.84)), "Подозрительная форма на бесплатном хостинге"
+            return max(prob, max(THRESHOLD + 0.20, 0.84)), "Подозрительный ресурс на облачном хостинге"
+        if feats["password_input"] > 0 or meta["has_sensitive_inputs"]:
+            return max(prob, max(THRESHOLD + 0.18, 0.82)), "Сбор учетных/платежных данных на неизвестном домене"
 
-    # 2. Контур защиты бизнеса от False Positive (с плавным демпфированием без константы 15.0%)
+    # --- КОНТУР 2: Подтвержденная репутация крупных доменов (Топ-500К и белый список) ---
     if (
         is_trusted_domain
         and feats["is_free_hosting"] == 0
         and feats["brand_squatting"] == 0
         and not meta["is_homograph"]
     ):
-        # Плавное масштабирование на основе ранга домена и сырого скора модели,
-        # чтобы каждый легитимный сайт имел уникальную низкую вероятность (0.3% - 7.5%)
         rank_norm = min(feats["global_rank"] / 500000.0, 1.0)
         damping_factor = 0.032 + 0.045 * rank_norm
         attenuated_prob = raw_prob * damping_factor
         prob = min(raw_prob, attenuated_prob) if raw_prob > 0.06 else raw_prob
         return prob, "Подтвержденная доменная репутация"
+
+    # --- КОНТУР 3: Защита легитимных нишевых сайтов и малого бизнеса (вне Топ-1М) ---
+    # Если сайт живой, работает по HTTPS, имеет полноценную HTML-разметку, не собирает пароли/карты,
+    # не использует фишинговые слова и зарегистрирован в нормальной доменной зоне — снимаем штраф модели за global_rank=2000000.
+    hyphen_count = meta["domain_name_only"].count("-")
+    is_clean_live_business_site = (
+        meta["page_reachable"]
+        and feats["html_length"] >= 600
+        and feats["is_https"] == 1
+        and feats["password_input"] == 0
+        and not meta["has_sensitive_inputs"]
+        and feats["brand_squatting"] == 0
+        and feats["is_free_hosting"] == 0
+        and feats["has_ip"] == 0
+        and not meta["is_homograph"]
+        and not meta["has_phishing_keywords"]
+        and suffix not in SUSPICIOUS_TLDS
+        and hyphen_count <= 1
+        and feats["eval_count"] <= 2
+    )
+
+    if is_clean_live_business_site:
+        # Масштабируем вероятность в безопасный коридор (12% - 23%) пропорционально исходной оценке модели
+        smb_prob = round(0.11 + 0.12 * raw_prob, 4)
+        return min(raw_prob, smb_prob), "Контент-инспекция: легитимный сайт без сбора паролей"
 
     return prob, "Оценка ансамбля LightGBM + TF-IDF"
 
@@ -621,6 +695,7 @@ async def index_page():
                 <button class="preset-btn" onclick="fillAndCheck('https://ya.ru')">✅ ya.ru</button>
                 <button class="preset-btn" onclick="fillAndCheck('https://sberbank.ru')">✅ sberbank.ru</button>
                 <button class="preset-btn" onclick="fillAndCheck('https://президент.рф')">✅ президент.рф</button>
+                <button class="preset-btn" onclick="fillAndCheck('https://ecogavan.com')">✅ Малый бизнес</button>
                 <button class="preset-btn" onclick="fillAndCheck('https://sber-verify.online/login')">🚨 sber-verify.online</button>
                 <button class="preset-btn" onclick="fillAndCheck('https://sberbаnk.ru')">🚨 IDN Homograph</button>
             </div>
