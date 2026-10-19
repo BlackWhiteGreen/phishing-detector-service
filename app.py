@@ -695,7 +695,6 @@ async def index_page():
                 <button class="preset-btn" onclick="fillAndCheck('https://ya.ru')">✅ ya.ru</button>
                 <button class="preset-btn" onclick="fillAndCheck('https://sberbank.ru')">✅ sberbank.ru</button>
                 <button class="preset-btn" onclick="fillAndCheck('https://президент.рф')">✅ президент.рф</button>
-                <button class="preset-btn" onclick="fillAndCheck('https://ecogavan.com')">✅ Малый бизнес</button>
                 <button class="preset-btn" onclick="fillAndCheck('https://sber-verify.online/login')">🚨 sber-verify.online</button>
                 <button class="preset-btn" onclick="fillAndCheck('https://sberbаnk.ru')">🚨 IDN Homograph</button>
             </div>
